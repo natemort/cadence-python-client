@@ -1,6 +1,5 @@
 import logging
 from dataclasses import dataclass
-import traceback
 from typing import List
 
 from cadence._internal.workflow.context import Context
@@ -8,18 +7,14 @@ from cadence._internal.workflow.decision_events_iterator import DecisionEventsIt
 from cadence._internal.workflow.deterministic_event_loop import DeterministicEventLoop
 from cadence._internal.workflow.statemachine.decision_manager import DecisionManager
 from cadence._internal.workflow.workflow_intance import WorkflowInstance
-from cadence.api.v1.common_pb2 import Failure, Payload
+from cadence.api.v1 import history
 from cadence.api.v1.decision_pb2 import (
-    CompleteWorkflowExecutionDecisionAttributes,
     Decision,
-    FailWorkflowExecutionDecisionAttributes,
 )
 from cadence.api.v1.history_pb2 import (
     HistoryEvent,
     WorkflowExecutionStartedEventAttributes,
 )
-from cadence.api.v1.service_worker_pb2 import PollForDecisionTaskResponse
-from cadence.error import WorkflowFailure
 from cadence.workflow import WorkflowDefinition, WorkflowInfo
 
 logger = logging.getLogger(__name__)
@@ -33,10 +28,12 @@ class DecisionResult:
 class WorkflowEngine:
     def __init__(self, info: WorkflowInfo, workflow_definition: WorkflowDefinition):
         self._event_loop = DeterministicEventLoop()
-        self._workflow_instance = WorkflowInstance(
-            self._event_loop, workflow_definition, info.data_converter
-        )
         self._decision_manager = DecisionManager(self._event_loop)
+        self._workflow_instance = WorkflowInstance(
+            self._event_loop,
+            workflow_definition,
+            info.data_converter,
+        )
         self._context = Context(info, self._decision_manager)
 
     def process_decision(
@@ -77,29 +74,6 @@ class WorkflowEngine:
                 # Collect all pending decisions from state machines
                 decisions = self._decision_manager.collect_pending_decisions()
 
-                # complete workflow if it is done
-                if self._workflow_instance.is_done():
-                    try:
-                        result = self._workflow_instance.get_result()
-                    except WorkflowFailure as e:
-                        decisions.append(
-                            Decision(
-                                fail_workflow_execution_decision_attributes=FailWorkflowExecutionDecisionAttributes(
-                                    failure=_failure_from_workflow_failure(e)
-                                )
-                            )
-                        )
-                    # TODO: handle cancellation error
-                    except Exception:
-                        raise
-                    else:
-                        decisions.append(
-                            Decision(
-                                complete_workflow_execution_decision_attributes=CompleteWorkflowExecutionDecisionAttributes(
-                                    result=result
-                                )
-                            )
-                        )
                 return DecisionResult(decisions=decisions)
 
         except Exception as e:
@@ -158,88 +132,58 @@ class WorkflowEngine:
                 ctx.set_replay_current_time_milliseconds(
                     decision_events.replay_current_time_milliseconds
                 )
-
-            # Phase 1: Process markers first
-            for marker_event in decision_events.markers:
-                logger.debug(
-                    "Processing marker event",
-                    extra={
-                        "workflow_id": ctx.info().workflow_id,
-                        "marker_name": getattr(marker_event, "marker_name", "unknown"),
-                        "event_id": getattr(marker_event, "event_id", None),
-                        "replay_mode": decision_events.replay,
-                    },
-                )
-                # Process through state machines (DecisionsHelper now delegates to DecisionManager)
-                self._decision_manager.handle_history_event(marker_event)
-
-            # Phase 2: Process regular input events
-            for event in decision_events.input:
-                logger.debug(
-                    "Processing history event",
-                    extra={
-                        "workflow_id": ctx.info().workflow_id,
-                        "event_type": getattr(event, "event_type", "unknown"),
-                        "event_id": getattr(event, "event_id", None),
-                        "replay_mode": decision_events.replay,
-                    },
-                )
-                # start workflow on workflow started event
-                if (
-                    event.WhichOneof("attributes")
-                    == "workflow_execution_started_event_attributes"
-                ):
-                    started_attrs: WorkflowExecutionStartedEventAttributes = (
-                        event.workflow_execution_started_event_attributes
+            with self._decision_manager.track_nondeterminism(
+                decision_events.replay, decision_events.output
+            ):
+                # Phase 1: Process markers first
+                for marker_event in decision_events.markers:
+                    logger.debug(
+                        "Processing marker event",
+                        extra={
+                            "workflow_id": ctx.info().workflow_id,
+                            "marker_name": getattr(
+                                marker_event, "marker_name", "unknown"
+                            ),
+                            "event_id": getattr(marker_event, "event_id", None),
+                            "replay_mode": decision_events.replay,
+                        },
                     )
-                    if started_attrs and hasattr(started_attrs, "input"):
-                        self._workflow_instance.start(started_attrs.input)
+                    # Process through state machines (DecisionsHelper now delegates to DecisionManager)
+                    self._decision_manager.handle_history_event(marker_event)
 
-                # Process through state machines (DecisionsHelper now delegates to DecisionManager)
-                self._decision_manager.handle_history_event(event)
+                # Phase 2: Process regular input events
+                for event in decision_events.input:
+                    self._apply_input_event(event)
 
-            # Phase 3: Execute workflow logic
-            self._workflow_instance.run_once()
+                # Phase 3: Execute workflow logic
+                self._workflow_instance.run_until_yield()
+
+                if outcome := self._workflow_instance.get_result():
+                    self._decision_manager.complete_workflow(outcome)
 
             # Phase 4: update state machine with output events
             for event in decision_events.output:
                 self._decision_manager.handle_history_event(event)
 
-    def _extract_workflow_input(
-        self, decision_task: PollForDecisionTaskResponse
-    ) -> Payload:
-        """
-        Extract workflow input from the decision task history.
+    def _apply_input_event(self, event: history.HistoryEvent) -> None:
+        logger.debug(
+            "Processing history event",
+            extra={
+                "workflow_id": self._context.info().workflow_id,
+                "event_type": getattr(event, "event_type", "unknown"),
+                "event_id": getattr(event, "event_id", None),
+                "replay_mode": self._context.is_replay_mode(),
+            },
+        )
+        # start workflow on workflow started event
+        if (
+            event.WhichOneof("attributes")
+            == "workflow_execution_started_event_attributes"
+        ):
+            started_attrs: WorkflowExecutionStartedEventAttributes = (
+                event.workflow_execution_started_event_attributes
+            )
+            if started_attrs and hasattr(started_attrs, "input"):
+                self._workflow_instance.start(started_attrs.input)
 
-        Args:
-            decision_task: The decision task containing workflow history
-
-        Returns:
-            The workflow input data, or None if not found
-        """
-        if not decision_task.history or not hasattr(decision_task.history, "events"):
-            raise ValueError("No history events found in decision task")
-
-        # Look for WorkflowExecutionStarted event
-        for event in decision_task.history.events:
-            if hasattr(event, "workflow_execution_started_event_attributes"):
-                started_attrs: WorkflowExecutionStartedEventAttributes = (
-                    event.workflow_execution_started_event_attributes
-                )
-                if started_attrs and hasattr(started_attrs, "input"):
-                    return started_attrs.input
-
-        raise ValueError("No WorkflowExecutionStarted event found in history")
-
-
-def _failure_from_workflow_failure(e: WorkflowFailure) -> Failure:
-    cause = e.__cause__
-
-    stacktrace = "".join(traceback.format_exception(cause))
-
-    details = f"message: {str(cause)}\nstacktrace: {stacktrace}"
-
-    return Failure(
-        reason=type(cause).__name__,
-        details=details.encode("utf-8"),
-    )
+        self._decision_manager.handle_history_event(event)
