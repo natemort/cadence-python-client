@@ -1,6 +1,12 @@
-import pytest
 import asyncio
-from cadence._internal.workflow.deterministic_event_loop import DeterministicEventLoop
+
+import pytest
+from cadence._internal.workflow.deterministic_event_loop import (
+    DecisionAbortedError,
+    DeterministicEventLoop,
+    FatalDecisionError,
+    fail_decision,
+)
 
 
 async def coro_append(results: list[int], i: int):
@@ -188,3 +194,97 @@ class TestDeterministicEventLoop:
             assert len(calls_p2) >= 2
         finally:
             self.loop._run_forever_cleanup()
+
+    def test_fail_decision_halts_loop_even_if_caught(self):
+        results: list[str] = []
+
+        async def swallow_fatal():
+            try:
+                fail_decision(FatalDecisionError("fatal"))
+            except BaseException:
+                results.append("caught")
+            await asyncio.sleep(0)
+            results.append("resumed")
+
+        self.loop.create_task(swallow_fatal())
+        self.loop.call_soon(results.append, "other")
+
+        with pytest.raises(FatalDecisionError, match="fatal"):
+            self.loop.run_until_yield()
+        assert results == ["caught"]
+
+        # The loop stays failed: later runs raise without running workflow code.
+        with pytest.raises(FatalDecisionError, match="fatal"):
+            self.loop.run_until_yield()
+        assert results == ["caught"]
+
+    def test_fail_decision_from_wait_condition_predicate(self):
+        calls_a: list[int] = []
+        polls_b: list[int] = []
+        waiters = []
+
+        def pred_a() -> bool:
+            calls_a.append(1)
+            if len(calls_a) > 1:
+                fail_decision(FatalDecisionError("fatal"))
+            return False
+
+        def pred_b() -> bool:
+            polls_b.append(1)
+            return False
+
+        async def register():
+            # Not awaited, so settling the first waiter schedules no work.
+            waiters.append(self.loop.create_waiter(pred_a))
+            waiters.append(self.loop.create_waiter(pred_b))
+
+        self.loop.create_task(register())
+        with pytest.raises(FatalDecisionError, match="fatal"):
+            self.loop.run_until_yield()
+
+        # The second predicate isn't polled again after the first one fails.
+        assert polls_b == [1]
+        waiters[0].exception()
+
+    def test_create_task_after_caught_fatal_error_raises(self):
+        original = FatalDecisionError("fatal")
+        refused: list[BaseException] = []
+
+        async def keeps_going():
+            try:
+                fail_decision(original)
+            except FatalDecisionError:
+                pass
+            try:
+                asyncio.create_task(coro_append([], 0))
+            except FatalDecisionError as e:
+                refused.append(e)
+
+        self.loop.create_task(keeps_going())
+        with pytest.raises(FatalDecisionError) as exc_info:
+            self.loop.run_until_yield()
+
+        assert exc_info.value is original
+        assert len(refused) == 1
+        assert isinstance(refused[0], DecisionAbortedError)
+        assert refused[0].__cause__ is original
+
+    def test_create_task_after_fatal_error_keeps_original_context(self):
+        original = FatalDecisionError("fatal")
+
+        async def keeps_going():
+            try:
+                fail_decision(original)
+            except FatalDecisionError:
+                pass
+            try:
+                raise KeyError("unrelated")
+            except KeyError:
+                asyncio.create_task(coro_append([], 0))
+
+        self.loop.create_task(keeps_going())
+        with pytest.raises(FatalDecisionError) as exc_info:
+            self.loop.run_until_yield()
+
+        assert exc_info.value is original
+        assert original.__context__ is None
