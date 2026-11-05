@@ -182,6 +182,9 @@ class ClientOptions(TypedDict, total=False):
     interceptors: list[ClientInterceptor]
     context_propagators: Sequence[ContextPropagator]
     workflow_interceptor_factory: WorkflowInterceptorFactory
+    # Creates the channel from the interceptor chain instead of dialing ``target``.
+    # Used to run against an in-process server, such as cadence.testing.TestServer.
+    channel_factory: Callable[[Sequence[ClientInterceptor]], Channel]
 
 
 def _identity(ctx: WorkflowContext) -> WorkflowContext:
@@ -908,7 +911,7 @@ def _validate_and_default_start_workflow_action(
 
 
 def _validate_and_copy_defaults(options: ClientOptions) -> ClientOptions:
-    if "target" not in options:
+    if "target" not in options and "channel_factory" not in options:
         raise ValueError("target must be specified")
 
     if "domain" not in options:
@@ -934,6 +937,10 @@ def _create_channel(options: ClientOptions) -> Channel:
     interceptors.append(RetryInterceptor())
     interceptors.append(MetricsInterceptor(options["metrics_emitter"]))
     interceptors.append(CadenceErrorInterceptor())
+
+    channel_factory = options.get("channel_factory")
+    if channel_factory is not None:
+        return channel_factory(interceptors)
 
     channel_arguments = options.get("channel_arguments") or {}
     grpc_channel_options: Sequence[tuple[str, Any]] = tuple(channel_arguments.items())
